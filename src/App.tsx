@@ -7,6 +7,7 @@ import {
 } from '@ant-design/icons'
 import { Alert, Badge, Button, Card, Checkbox, Divider, Empty, Input, Modal, Radio, Segmented, Select, Space, Tag, Tooltip, message } from 'antd'
 import { submitRemotePatch } from './services/mockApi'
+import { buildAnchorSegments } from './services/anchoring'
 import { useReviewStore } from './store/review'
 import type { Comment, CommentType, Paragraph, Role } from './types'
 
@@ -30,6 +31,7 @@ export default function App() {
   const [commentBody, setCommentBody] = useState('')
   const [suggestion, setSuggestion] = useState('')
   const [quote, setQuote] = useState('')
+  const [anchorOffset, setAnchorOffset] = useState<number | undefined>(undefined)
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({})
   const [versionOpen, setVersionOpen] = useState(false)
   const [versionA, setVersionA] = useState(versions[1]?.id ?? versions[0]?.id)
@@ -47,6 +49,7 @@ export default function App() {
     if (commentFilter === 'open') return comment.status === 'open'
     if (commentFilter === 'suggestion') return comment.type === 'suggestion' && comment.status === 'open'
     if (commentFilter === 'duplicate') return duplicateParagraphIds.has(comment.paragraphId) && comment.status === 'open'
+    if (commentFilter === 'orphan') return comment.anchorStatus === 'orphaned' && comment.status === 'open'
     return true
   }).sort((a, b) => b.createdAt - a.createdAt), [commentFilter, comments, duplicateParagraphIds])
 
@@ -90,16 +93,33 @@ export default function App() {
     document.getElementById(`paragraph-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
   const openComposer = (type: CommentType) => {
-    const selectedText = window.getSelection()?.toString().trim()
-    setQuote(selectedText && selected?.text.includes(selectedText) ? selectedText : selected?.text.slice(0, 64) ?? '')
+    const selection = window.getSelection()
+    const selectedText = selection?.toString().trim()
+    const nextQuote = selectedText && selected?.text.includes(selectedText) ? selectedText : selected?.text.slice(0, 64) ?? ''
+    // 记录选区在段落正文中的字符偏移，用于同句多次出现时认最近的那次
+    let nextOffset: number | undefined
+    if (selectedText && selection && selection.rangeCount > 0 && selected) {
+      const range = selection.getRangeAt(0)
+      const paragraphEl = document.getElementById(`paragraph-${selected.id}`)
+      const textEl = paragraphEl?.querySelector('.paragraph-text')
+      if (textEl && textEl.contains(range.startContainer)) {
+        const preRange = range.cloneRange()
+        preRange.selectNodeContents(textEl)
+        preRange.setEnd(range.startContainer, range.startOffset)
+        const computed = preRange.toString().length
+        if (selected.text.slice(computed, computed + nextQuote.length) === nextQuote) nextOffset = computed
+      }
+    }
+    setQuote(nextQuote)
+    setAnchorOffset(nextOffset)
     setSuggestion(type === 'suggestion' ? selected?.text ?? '' : '')
     setCommentType(type)
     setComposerOpen(true)
   }
   const submitComment = () => {
     if (!selected || !commentBody.trim()) { message.warning('请填写批注内容'); return }
-    addComment({ paragraphId: selected.id, type: commentType, quote, body: commentBody.trim(), suggestion: commentType === 'suggestion' ? suggestion : undefined })
-    setCommentBody(''); setSuggestion(''); setQuote(''); setComposerOpen(false)
+    addComment({ paragraphId: selected.id, type: commentType, quote, body: commentBody.trim(), suggestion: commentType === 'suggestion' ? suggestion : undefined, anchorOffset })
+    setCommentBody(''); setSuggestion(''); setQuote(''); setAnchorOffset(undefined); setComposerOpen(false)
     message.success(commentType === 'suggestion' ? '修改建议已提交' : '段落批注已添加')
   }
   const handleMockConflict = async () => {
@@ -223,7 +243,9 @@ export default function App() {
                     ) : role === 'author' ? (
                       <Input.TextArea autoSize={{ minRows: 2, maxRows: 8 }} value={paragraph.text} readOnly={paragraph.status === 'locked'} onChange={(event) => updateParagraph(paragraph.id, event.target.value)} />
                     ) : (
-                      <p className="paragraph-text">{paragraph.text}</p>
+                      <p className="paragraph-text">{buildAnchorSegments(paragraph.text, comments
+                        .filter((comment) => comment.paragraphId === paragraph.id && comment.anchorStatus === 'anchored' && comment.status === 'open')
+                        .map((comment) => ({ offset: comment.anchorOffset, length: comment.anchorLength ?? comment.quote.length })))}</p>
                     )}
                     <div className="paragraph-actions">
                       {role === 'reviewer' && <><Button size="small" icon={<CommentOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('comment') }}>添加批注</Button><Button size="small" icon={<FileDoneOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('suggestion') }}>提出建议</Button></>}
@@ -243,7 +265,7 @@ export default function App() {
           </div>
           <div className="comment-filters">
             <Radio.Group value={commentFilter} onChange={(event) => setCommentFilter(event.target.value)} buttonStyle="solid" size="small">
-              <Radio.Button value="all">全部</Radio.Button><Radio.Button value="open">待处理</Radio.Button><Radio.Button value="suggestion">建议</Radio.Button><Radio.Button value="duplicate">重复</Radio.Button>
+              <Radio.Button value="all">全部</Radio.Button><Radio.Button value="open">待处理</Radio.Button><Radio.Button value="suggestion">建议</Radio.Button><Radio.Button value="duplicate">重复</Radio.Button><Radio.Button value="orphan">失联</Radio.Button>
             </Radio.Group>
           </div>
           <div className="comment-list">
@@ -251,7 +273,14 @@ export default function App() {
               const paragraph = paragraphs.find((item) => item.id === comment.paragraphId)
               return (
                 <Card key={comment.id} size="small" className={`comment-card ${comment.status}`} title={<span>{comment.author} <Tag>{comment.type === 'suggestion' ? '修改建议' : '段落批注'}</Tag></span>} extra={<small>{formatDate(comment.createdAt)}</small>}>
-                  <button className="quote-line" onClick={() => paragraph && scrollToParagraph(paragraph.id)}>“{comment.quote}” · 段落 {paragraph?.number}</button>
+                  {comment.anchorStatus === 'orphaned' && comment.status === 'open' ? (
+                    <span className="quote-line disabled" title={comment.anchorReason}>“{comment.quote}” · 原句落点待确认</span>
+                  ) : (
+                    <button className="quote-line" onClick={() => paragraph && scrollToParagraph(paragraph.id)}>“{comment.quote}” · 段落 {paragraph?.number}</button>
+                  )}
+                  {comment.status === 'open' && comment.anchorStatus === 'orphaned' && (
+                    <Alert className="orphan-alert" type="warning" showIcon message="原句落点待确认" description={comment.anchorReason ?? '原句在修改后的正文中无法找到，可恢复原文或重新批注'} />
+                  )}
                   <p className="comment-body">{comment.body}</p>
                   {comment.suggestion && <div className="suggestion-box"><small>建议改为</small><p>{comment.suggestion}</p></div>}
                   {comment.status !== 'open' && <Tag color={comment.status === 'accepted' ? 'green' : comment.status === 'rejected' ? 'red' : 'blue'}>{comment.status === 'accepted' ? '已接受' : comment.status === 'rejected' ? '已拒绝' : '已合并'}</Tag>}

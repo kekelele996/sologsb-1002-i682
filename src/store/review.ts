@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { Comment, EditConflict, Paragraph, Reply, Role, Version } from '../types'
+import { anchorForQuote, reanchorComments } from '../services/anchoring'
 
 const DRAFT_KEY = 'sologsb-1002-draft-v1'
 const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
@@ -13,7 +14,8 @@ const baseParagraphs: Paragraph[] = [
   { id: 'p-06', section: '3 结果', number: '6.', text: '初步结果显示，辅助工具缩短了首次响应时间，但没有显著降低维护者处理复杂议题的认知负担。', original: '初步结果显示，辅助工具缩短了首次响应时间，但没有显著降低维护者处理复杂议题的认知负担。', status: 'open', highlighted: true },
   { id: 'p-07', section: '3 结果', number: '7.', text: '在高活跃度项目中，维护者更关注建议是否可验证，而非建议生成速度。', original: '在高活跃度项目中，维护者更关注建议是否可验证，而非建议生成速度。', status: 'open', highlighted: false },
 ]
-const baseComments: Comment[] = [
+type SeedComment = Omit<Comment, 'anchorStatus' | 'anchorOffset' | 'anchorLength' | 'anchorReason'>
+const seedComments: SeedComment[] = [
   { id: 'c-01', paragraphId: 'p-02', author: '审稿人 A', role: 'reviewer', type: 'suggestion', quote: '其真实维护工作流中的影响', body: '建议把“影响”具体化为可观察指标。', suggestion: '近年来，大型语言模型被广泛用于代码生成与缺陷定位，但在真实维护工作流中究竟改变了哪些协作行为，仍缺少系统证据。', status: 'open', replies: [{ id: 'r-01', author: '作者', role: 'author', body: '可以，修改后会补充指标定义。', createdAt: Date.now() - 7200000 }], createdAt: Date.now() - 86400000 },
   { id: 'c-02', paragraphId: 'p-02', author: '审稿人 B', role: 'reviewer', type: 'comment', quote: '缺少系统证据', body: '这里的“系统证据”范围过大，建议限定为本研究覆盖的议题语料。', status: 'open', replies: [], createdAt: Date.now() - 64000000 },
   { id: 'c-03', paragraphId: 'p-03', author: '审稿人 A', role: 'reviewer', type: 'comment', quote: '26 位核心维护者', body: '请说明抽样方式和地域分布，避免样本选择偏差。', status: 'open', replies: [], createdAt: Date.now() - 54000000 },
@@ -21,10 +23,38 @@ const baseComments: Comment[] = [
   { id: 'c-05', paragraphId: 'p-05', author: '审稿人 D', role: 'reviewer', type: 'comment', quote: '邀请第三位研究者裁决', body: '与上一段重复：都在说明编码分歧如何解决，建议合并意见。', status: 'open', replies: [], createdAt: Date.now() - 43000000 },
   { id: 'c-06', paragraphId: 'p-06', author: '审稿人 B', role: 'reviewer', type: 'suggestion', quote: '但没有显著降低维护者处理复杂议题的认知负担', body: '“显著”需要给出统计检验与效应量。', suggestion: '初步结果显示，辅助工具缩短了首次响应时间，但对复杂议题处理时长与自我报告认知负担均未产生统计显著影响。', status: 'open', replies: [], createdAt: Date.now() - 36000000 },
 ]
+// 种子批注按引用原句在段落中首次出现的位置落锚
+const baseComments: Comment[] = seedComments.map((comment) => {
+  const paragraph = baseParagraphs.find((item) => item.id === comment.paragraphId)
+  const anchor = anchorForQuote(paragraph, comment.quote)
+  return {
+    ...comment,
+    anchorStatus: anchor.length > 0 ? 'anchored' : 'orphaned',
+    anchorOffset: anchor.offset,
+    anchorLength: anchor.length,
+    anchorReason: anchor.length > 0 ? undefined : '引用原句在段落中未找到',
+  }
+})
+
+/** 旧草稿数据迁移：缺少落点字段的批注按当前正文补锚 */
+const migrateComments = (stored: Comment[] | undefined, paragraphs: Paragraph[]): Comment[] =>
+  (stored ?? baseComments).map((comment) => {
+    if (comment.anchorStatus) return comment
+    const paragraph = paragraphs.find((item) => item.id === comment.paragraphId)
+    const anchor = anchorForQuote(paragraph, comment.quote)
+    return {
+      ...comment,
+      anchorStatus: anchor.length > 0 ? 'anchored' : 'orphaned',
+      anchorOffset: anchor.offset,
+      anchorLength: anchor.length,
+      anchorReason: anchor.length > 0 ? undefined : '本地草稿升级后重新确认落点失败',
+    }
+  })
+
 const seed = typeof localStorage !== 'undefined' ? localStorage.getItem(DRAFT_KEY) : null
 const parsed = seed ? JSON.parse(seed) as Partial<{ paragraphs: Paragraph[]; comments: Comment[]; versions: Version[] }> : null
 const initialParagraphs = parsed?.paragraphs?.length ? parsed.paragraphs : baseParagraphs
-const initialComments = parsed?.comments ?? baseComments
+const initialComments = migrateComments(parsed?.comments, initialParagraphs)
 const initialVersions: Version[] = parsed?.versions ?? [
   { id: 'v-01', label: '投稿初稿 v1', createdAt: Date.now() - 1209600000, paragraphs: JSON.parse(JSON.stringify(baseParagraphs)) as Paragraph[] },
   { id: 'v-02', label: '审阅基线 v2', createdAt: Date.now() - 172800000, paragraphs: JSON.parse(JSON.stringify(baseParagraphs.map((p) => p.id === 'p-04' ? { ...p, text: `${p.text} 编码规则在预注册方案中说明。` } : p))) as Paragraph[] },
@@ -41,7 +71,7 @@ interface ReviewState {
   comments: Comment[]
   versions: Version[]
   selectedParagraphId: string
-  commentFilter: 'all' | 'open' | 'suggestion' | 'duplicate'
+  commentFilter: 'all' | 'open' | 'suggestion' | 'duplicate' | 'orphan'
   revisionMode: boolean
   dirty: boolean
   conflicts: EditConflict[]
@@ -52,7 +82,7 @@ interface ReviewState {
   setCommentFilter: (filter: ReviewState['commentFilter']) => void
   setRevisionMode: (value: boolean) => void
   updateParagraph: (id: string, text: string) => void
-  addComment: (input: Pick<Comment, 'paragraphId' | 'type' | 'quote' | 'body' | 'suggestion'>) => void
+  addComment: (input: Pick<Comment, 'paragraphId' | 'type' | 'quote' | 'body' | 'suggestion'> & { anchorOffset?: number }) => void
   replyComment: (commentId: string, body: string) => void
   resolveSuggestion: (commentId: string, accepted: boolean) => void
   mergeComment: (commentId: string, targetId: string) => void
@@ -94,22 +124,36 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     selectParagraph: (selectedParagraphId) => set({ selectedParagraphId }),
     setCommentFilter: (commentFilter) => set({ commentFilter }),
     setRevisionMode: (revisionMode) => set({ revisionMode }),
-    updateParagraph: (paragraphId, text) => record((state) => ({
-      paragraphs: state.paragraphs.map((paragraph) => paragraph.id === paragraphId && paragraph.status !== 'locked'
+    updateParagraph: (paragraphId, text) => record((state) => {
+      const paragraphs = state.paragraphs.map((paragraph) => paragraph.id === paragraphId && paragraph.status !== 'locked'
         ? { ...paragraph, text, status: 'open' as const, highlighted: true }
-        : paragraph),
-    })),
-    addComment: (input) => record((state) => ({
-      comments: [{
-        ...input,
-        id: id('comment'),
-        author: state.role === 'reviewer' ? '审稿人 A' : state.role === 'author' ? '作者' : '编辑',
-        role: state.role,
-        status: 'open',
-        replies: [],
-        createdAt: Date.now(),
-      }, ...state.comments],
-    })),
+        : paragraph)
+      const textChanged = state.paragraphs.find((paragraph) => paragraph.id === paragraphId)?.text !== text
+      return {
+        paragraphs,
+        // 正文改动后，该段批注按引用原句重新确认落点：落得回去的跟着走，落不回去的留在待处理
+        comments: textChanged ? reanchorComments(state.comments, paragraphs) : state.comments,
+      }
+    }),
+    addComment: (input) => record((state) => {
+      const paragraph = state.paragraphs.find((item) => item.id === input.paragraphId)
+      const anchor = anchorForQuote(paragraph, input.quote, input.anchorOffset)
+      return {
+        comments: [{
+          ...input,
+          id: id('comment'),
+          author: state.role === 'reviewer' ? '审稿人 A' : state.role === 'author' ? '作者' : '编辑',
+          role: state.role,
+          status: 'open',
+          replies: [],
+          createdAt: Date.now(),
+          anchorStatus: anchor.length > 0 ? 'anchored' : 'orphaned',
+          anchorOffset: anchor.offset,
+          anchorLength: anchor.length,
+          anchorReason: anchor.length > 0 ? undefined : '引用原句在段落中未找到',
+        }, ...state.comments],
+      }
+    }),
     replyComment: (commentId, body) => record((state) => ({
       comments: state.comments.map((comment) => comment.id === commentId ? {
         ...comment,
@@ -118,16 +162,39 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     })),
     resolveSuggestion: (commentId, accepted) => record((state) => {
       const comment = state.comments.find((item) => item.id === commentId)
+      const textChanged = accepted && comment?.suggestion
+      const paragraphs = textChanged
+        ? state.paragraphs.map((paragraph) => paragraph.id === comment.paragraphId ? { ...paragraph, text: comment.suggestion as string, status: 'accepted' as const } : paragraph)
+        : state.paragraphs
       return {
-        comments: state.comments.map((item) => item.id === commentId ? { ...item, status: accepted ? 'accepted' : 'rejected' } : item),
-        paragraphs: comment?.suggestion && accepted
-          ? state.paragraphs.map((paragraph) => paragraph.id === comment.paragraphId ? { ...paragraph, text: comment.suggestion as string, status: 'accepted' } : paragraph)
-          : state.paragraphs,
+        paragraphs,
+        comments: state.comments.map((item) => {
+          if (item.id === commentId) return { ...item, status: accepted ? 'accepted' as const : 'rejected' as const }
+          // 建议被接受后正文整段替换，同段其他批注需要重新确认落点
+          return textChanged && item.paragraphId === comment.paragraphId ? reanchorComments([item], paragraphs)[0] : item
+        }),
       }
     }),
-    mergeComment: (commentId, targetId) => record((state) => ({
-      comments: state.comments.map((comment) => comment.id === commentId ? { ...comment, status: 'merged', mergedInto: targetId } : comment),
-    })),
+    mergeComment: (commentId, targetId) => record((state) => {
+      const source = state.comments.find((item) => item.id === commentId)
+      const target = state.comments.find((item) => item.id === targetId)
+      if (!source || !target || source.id === target.id) return {}
+      const transferNote: Reply = {
+        id: id('reply'),
+        author: '编辑',
+        role: 'editor',
+        body: `该意见已合并自 ${source.author} 的批注「${source.body}」，原讨论一并转入。`,
+        createdAt: Date.now(),
+      }
+      return {
+        comments: state.comments.map((comment) => {
+          if (comment.id === commentId) return { ...comment, status: 'merged' as const, mergedInto: targetId, replies: [] }
+          // 被并掉那条的讨论（回复）转到留下的那条上
+          if (comment.id === targetId) return { ...comment, replies: [...comment.replies, ...source.replies, transferNote] }
+          return comment
+        }),
+      }
+    }),
     toggleLock: (paragraphId) => record((state) => ({
       paragraphs: state.paragraphs.map((paragraph) => paragraph.id === paragraphId ? {
         ...paragraph,
@@ -140,10 +207,15 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     addConflict: (conflict) => set((state) => ({ conflicts: [conflict, ...state.conflicts] })),
     resolveConflict: (conflictId, strategy) => record((state) => {
       const conflict = state.conflicts.find((item) => item.id === conflictId)
+      const paragraphs = conflict && strategy === 'remote'
+        ? state.paragraphs.map((paragraph) => paragraph.id === conflict.paragraphId ? { ...paragraph, text: conflict.remoteText, highlighted: true } : paragraph)
+        : state.paragraphs
       return {
-        paragraphs: conflict && strategy === 'remote'
-          ? state.paragraphs.map((paragraph) => paragraph.id === conflict.paragraphId ? { ...paragraph, text: conflict.remoteText, highlighted: true } : paragraph)
-          : state.paragraphs,
+        paragraphs,
+        // 采用远端版本后正文改动，该段批注重新确认落点
+        comments: strategy === 'remote' && conflict
+          ? reanchorComments(state.comments, paragraphs)
+          : state.comments,
         conflicts: state.conflicts.filter((item) => item.id !== conflictId),
       }
     }),

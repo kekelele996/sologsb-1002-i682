@@ -2,6 +2,7 @@ export type Role = 'author' | 'reviewer' | 'editor'
 export type ParagraphStatus = 'open' | 'accepted' | 'locked'
 export type CommentStatus = 'open' | 'accepted' | 'rejected' | 'merged'
 export type CommentType = 'comment' | 'suggestion'
+export type AnchorStatus = 'anchored' | 'orphaned'
 
 export interface Reply {
   id: string
@@ -24,6 +25,13 @@ export interface Comment {
   replies: Reply[]
   createdAt: number
   mergedInto?: string
+  /** 落点状态：anchored 已跟随正文，orphaned 落不回去、留在待处理并写明原因 */
+  anchorStatus: AnchorStatus
+  /** 引用原句在段落正文中的字符偏移，用于同句多次出现时认最近的那次 */
+  anchorOffset: number
+  /** 落点覆盖长度（模糊匹配时与原句长度不同） */
+  anchorLength?: number
+  anchorReason?: string
 }
 
 export interface Paragraph {
