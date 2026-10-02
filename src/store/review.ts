@@ -1,7 +1,8 @@
 import { create } from 'zustand'
 import type { Comment, EditConflict, Paragraph, Reply, Role, Version } from '../types'
+import { resolveAnchor } from '../services/anchors'
 
-const DRAFT_KEY = 'sologsb-1002-draft-v1'
+const DRAFT_KEY = 'sologsb-1002-draft-v2'
 const id = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 
 const baseParagraphs: Paragraph[] = [
@@ -12,28 +13,63 @@ const baseParagraphs: Paragraph[] = [
   { id: 'p-05', section: '2 方法', number: '5.', text: '当编码结果不一致时，研究者通过讨论达成一致；若仍有分歧，则邀请第三位研究者裁决。', original: '当编码结果不一致时，研究者通过讨论达成一致；若仍有分歧，则邀请第三位研究者裁决。', status: 'accepted', highlighted: true },
   { id: 'p-06', section: '3 结果', number: '6.', text: '初步结果显示，辅助工具缩短了首次响应时间，但没有显著降低维护者处理复杂议题的认知负担。', original: '初步结果显示，辅助工具缩短了首次响应时间，但没有显著降低维护者处理复杂议题的认知负担。', status: 'open', highlighted: true },
   { id: 'p-07', section: '3 结果', number: '7.', text: '在高活跃度项目中，维护者更关注建议是否可验证，而非建议生成速度。', original: '在高活跃度项目中，维护者更关注建议是否可验证，而非建议生成速度。', status: 'open', highlighted: false },
+  // 同一句“结果表明”在段落中出现两次，用于演示批注认离它最近的那次
+  { id: 'p-08', section: '4 讨论', number: '8.', text: '结果表明，工具更擅长处理结构清晰的任务。对于缺少明确验收标准的议题，结果表明，人工判断仍然不可替代。', original: '结果表明，工具更擅长处理结构清晰的任务。对于缺少明确验收标准的议题，结果表明，人工判断仍然不可替代。', status: 'open', highlighted: false },
 ]
-const baseComments: Comment[] = [
+
+type SeedComment = Omit<Comment, 'anchorStatus' | 'anchorOffset' | 'anchorReason'>
+
+const baseComments: SeedComment[] = [
   { id: 'c-01', paragraphId: 'p-02', author: '审稿人 A', role: 'reviewer', type: 'suggestion', quote: '其真实维护工作流中的影响', body: '建议把“影响”具体化为可观察指标。', suggestion: '近年来，大型语言模型被广泛用于代码生成与缺陷定位，但在真实维护工作流中究竟改变了哪些协作行为，仍缺少系统证据。', status: 'open', replies: [{ id: 'r-01', author: '作者', role: 'author', body: '可以，修改后会补充指标定义。', createdAt: Date.now() - 7200000 }], createdAt: Date.now() - 86400000 },
-  { id: 'c-02', paragraphId: 'p-02', author: '审稿人 B', role: 'reviewer', type: 'comment', quote: '缺少系统证据', body: '这里的“系统证据”范围过大，建议限定为本研究覆盖的议题语料。', status: 'open', replies: [], createdAt: Date.now() - 64000000 },
+  { id: 'c-02', paragraphId: 'p-02', author: '审稿人 B', role: 'reviewer', type: 'comment', quote: '缺少系统证据', body: '这里的“系统证据”范围过大，建议限定为本研究覆盖的议题语料。', status: 'open', replies: [{ id: 'r-02', author: '审稿人 B', role: 'reviewer', body: '这条与 c-01 关注的位置相邻，编辑可以合并演示讨论转移。', createdAt: Date.now() - 70000000 }], createdAt: Date.now() - 64000000 },
   { id: 'c-03', paragraphId: 'p-03', author: '审稿人 A', role: 'reviewer', type: 'comment', quote: '26 位核心维护者', body: '请说明抽样方式和地域分布，避免样本选择偏差。', status: 'open', replies: [], createdAt: Date.now() - 54000000 },
   { id: 'c-04', paragraphId: 'p-04', author: '审稿人 C', role: 'reviewer', type: 'comment', quote: '两名研究者独立完成', body: '建议报告编码者间一致性系数，并明确不一致处理规则。', status: 'open', replies: [], createdAt: Date.now() - 48000000 },
   { id: 'c-05', paragraphId: 'p-05', author: '审稿人 D', role: 'reviewer', type: 'comment', quote: '邀请第三位研究者裁决', body: '与上一段重复：都在说明编码分歧如何解决，建议合并意见。', status: 'open', replies: [], createdAt: Date.now() - 43000000 },
   { id: 'c-06', paragraphId: 'p-06', author: '审稿人 B', role: 'reviewer', type: 'suggestion', quote: '但没有显著降低维护者处理复杂议题的认知负担', body: '“显著”需要给出统计检验与效应量。', suggestion: '初步结果显示，辅助工具缩短了首次响应时间，但对复杂议题处理时长与自我报告认知负担均未产生统计显著影响。', status: 'open', replies: [], createdAt: Date.now() - 36000000 },
+  // 挂在第二处“结果表明”上，正文改动后应重新确认到离原落点最近的那次出现
+  { id: 'c-07', paragraphId: 'p-08', author: '审稿人 C', role: 'reviewer', type: 'comment', quote: '结果表明', body: '第二处“结果表明”建议改为“我们进一步发现”，避免与段首表述重复。', status: 'open', replies: [], createdAt: Date.now() - 30000000 },
 ]
-const seed = typeof localStorage !== 'undefined' ? localStorage.getItem(DRAFT_KEY) : null
-const parsed = seed ? JSON.parse(seed) as Partial<{ paragraphs: Paragraph[]; comments: Comment[]; versions: Version[] }> : null
-const initialParagraphs = parsed?.paragraphs?.length ? parsed.paragraphs : baseParagraphs
-const initialComments = parsed?.comments ?? baseComments
-const initialVersions: Version[] = parsed?.versions ?? [
+
+/** 为批注按引用原句确认初始落点 */
+const hydrateComment = (comment: SeedComment, paragraph: Paragraph | undefined): Comment => {
+  if (!paragraph) return { ...comment, anchorStatus: 'pending', anchorOffset: -1, anchorReason: '所属段落不存在，无法确认落点' }
+  const anchor = resolveAnchor(paragraph.text, comment.quote, null)
+  return { ...comment, anchorStatus: anchor.status, anchorOffset: anchor.offset, anchorReason: anchor.reason }
+}
+const hydrateComments = (comments: Comment[], paragraphs: Paragraph[]): Comment[] => comments.map((comment) => {
+  const paragraph = paragraphs.find((item) => item.id === comment.paragraphId)
+  const anchor = resolveAnchor(paragraph?.text ?? '', comment.quote ?? '', typeof comment.anchorOffset === 'number' ? comment.anchorOffset : null)
+  return { ...comment, anchorStatus: anchor.status, anchorOffset: anchor.offset, anchorReason: anchor.reason }
+})
+
+const seededComments = hydrateComments(baseComments as Comment[], baseParagraphs)
+const seedVersions: Version[] = [
   { id: 'v-01', label: '投稿初稿 v1', createdAt: Date.now() - 1209600000, paragraphs: JSON.parse(JSON.stringify(baseParagraphs)) as Paragraph[] },
   { id: 'v-02', label: '审阅基线 v2', createdAt: Date.now() - 172800000, paragraphs: JSON.parse(JSON.stringify(baseParagraphs.map((p) => p.id === 'p-04' ? { ...p, text: `${p.text} 编码规则在预注册方案中说明。` } : p))) as Paragraph[] },
 ]
+
+const seed = typeof localStorage !== 'undefined' ? localStorage.getItem(DRAFT_KEY) : null
+const parsed = seed ? JSON.parse(seed) as Partial<{ paragraphs: Paragraph[]; comments: Comment[]; versions: Version[] }> : null
+const initialParagraphs = parsed?.paragraphs?.length ? parsed.paragraphs : baseParagraphs
+const initialComments = parsed?.comments?.length
+  ? hydrateComments(parsed.comments, initialParagraphs)
+  : seededComments
+const initialVersions: Version[] = parsed?.versions?.length ? parsed.versions : seedVersions
 
 const persistDraft = (paragraphs: Paragraph[], comments: Comment[], versions: Version[]) => {
   localStorage.setItem(DRAFT_KEY, JSON.stringify({ paragraphs, comments, versions }))
 }
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
+
+/**
+ * 段落正文改动后，逐条重新确认挂在该段的批注：
+ * 引用原句还在就跟着走（多次出现认最近的一次），不在了就留在待处理并写清原因。
+ */
+const reanchorParagraph = (comments: Comment[], paragraph: Paragraph): Comment[] => comments.map((comment) => {
+  if (comment.paragraphId !== paragraph.id) return comment
+  const anchor = resolveAnchor(paragraph.text, comment.quote, comment.anchorOffset)
+  return { ...comment, anchorStatus: anchor.status, anchorOffset: anchor.offset, anchorReason: anchor.reason }
+})
 
 interface ReviewState {
   role: Role
@@ -41,7 +77,7 @@ interface ReviewState {
   comments: Comment[]
   versions: Version[]
   selectedParagraphId: string
-  commentFilter: 'all' | 'open' | 'suggestion' | 'duplicate'
+  commentFilter: 'all' | 'open' | 'pending' | 'suggestion' | 'duplicate'
   revisionMode: boolean
   dirty: boolean
   conflicts: EditConflict[]
@@ -56,6 +92,7 @@ interface ReviewState {
   replyComment: (commentId: string, body: string) => void
   resolveSuggestion: (commentId: string, accepted: boolean) => void
   mergeComment: (commentId: string, targetId: string) => void
+  requoteComment: (commentId: string, quote: string) => void
   toggleLock: (paragraphId: string) => void
   createVersion: (label: string) => void
   addConflict: (conflict: EditConflict) => void
@@ -94,13 +131,19 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     selectParagraph: (selectedParagraphId) => set({ selectedParagraphId }),
     setCommentFilter: (commentFilter) => set({ commentFilter }),
     setRevisionMode: (revisionMode) => set({ revisionMode }),
-    updateParagraph: (paragraphId, text) => record((state) => ({
-      paragraphs: state.paragraphs.map((paragraph) => paragraph.id === paragraphId && paragraph.status !== 'locked'
+    updateParagraph: (paragraphId, text) => record((state) => {
+      const paragraphs = state.paragraphs.map((paragraph) => paragraph.id === paragraphId && paragraph.status !== 'locked'
         ? { ...paragraph, text, status: 'open' as const, highlighted: true }
-        : paragraph),
-    })),
-    addComment: (input) => record((state) => ({
-      comments: [{
+        : paragraph)
+      const changed = paragraphs.find((paragraph) => paragraph.id === paragraphId)
+      // 正文一改，批注按引用原句重新确认落点
+      const comments = changed ? reanchorParagraph(state.comments, changed) : state.comments
+      return { paragraphs, comments }
+    }),
+    addComment: (input) => record((state) => {
+      const paragraph = state.paragraphs.find((item) => item.id === input.paragraphId)
+      const anchor = resolveAnchor(paragraph?.text ?? '', input.quote, null)
+      const comment: Comment = {
         ...input,
         id: id('comment'),
         author: state.role === 'reviewer' ? '审稿人 A' : state.role === 'author' ? '作者' : '编辑',
@@ -108,8 +151,12 @@ export const useReviewStore = create<ReviewState>((set, get) => {
         status: 'open',
         replies: [],
         createdAt: Date.now(),
-      }, ...state.comments],
-    })),
+        anchorStatus: anchor.status,
+        anchorOffset: anchor.offset,
+        anchorReason: anchor.reason,
+      }
+      return { comments: [comment, ...state.comments] }
+    }),
     replyComment: (commentId, body) => record((state) => ({
       comments: state.comments.map((comment) => comment.id === commentId ? {
         ...comment,
@@ -118,16 +165,48 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     })),
     resolveSuggestion: (commentId, accepted) => record((state) => {
       const comment = state.comments.find((item) => item.id === commentId)
+      let paragraphs = state.paragraphs
+      let comments = state.comments
+      if (comment?.suggestion && accepted) {
+        paragraphs = state.paragraphs.map((paragraph) => paragraph.id === comment.paragraphId ? { ...paragraph, text: comment.suggestion as string, status: 'accepted' } : paragraph)
+        const changed = paragraphs.find((paragraph) => paragraph.id === comment.paragraphId)
+        if (changed) comments = reanchorParagraph(comments, changed)
+      }
+      comments = comments.map((item) => item.id === commentId ? { ...item, status: accepted ? 'accepted' : 'rejected' } : item)
+      return { comments, paragraphs }
+    }),
+    // 编辑合并重复意见：被并掉那条的讨论转到留下的那条上
+    mergeComment: (commentId, targetId) => record((state) => {
+      const source = state.comments.find((item) => item.id === commentId)
+      const target = state.comments.find((item) => item.id === targetId)
+      if (!source || !target || source.id === target.id) return {}
+      const transferNote: Reply = {
+        id: id('reply'),
+        author: '编辑',
+        role: 'editor',
+        body: `合并自 ${source.author} 的意见：${source.body}（原引用“${source.quote}”）`,
+        createdAt: Date.now(),
+      }
       return {
-        comments: state.comments.map((item) => item.id === commentId ? { ...item, status: accepted ? 'accepted' : 'rejected' } : item),
-        paragraphs: comment?.suggestion && accepted
-          ? state.paragraphs.map((paragraph) => paragraph.id === comment.paragraphId ? { ...paragraph, text: comment.suggestion as string, status: 'accepted' } : paragraph)
-          : state.paragraphs,
+        comments: state.comments.map((comment) => {
+          if (comment.id === targetId) return { ...comment, replies: [...comment.replies, ...source.replies, transferNote] }
+          if (comment.id === commentId) return { ...comment, status: 'merged', mergedInto: targetId }
+          return comment
+        }),
       }
     }),
-    mergeComment: (commentId, targetId) => record((state) => ({
-      comments: state.comments.map((comment) => comment.id === commentId ? { ...comment, status: 'merged', mergedInto: targetId } : comment),
-    })),
+    // 审稿人一侧重新指定引用原句，落点按新原句在正文中重新确认
+    requoteComment: (commentId, quote) => record((state) => {
+      const existing = state.comments.find((item) => item.id === commentId)
+      const paragraph = state.paragraphs.find((item) => item.id === existing?.paragraphId)
+      if (!existing || !paragraph) return {}
+      const anchor = resolveAnchor(paragraph.text, quote, null)
+      return {
+        comments: state.comments.map((comment) => comment.id === commentId
+          ? { ...comment, quote, anchorStatus: anchor.status, anchorOffset: anchor.offset, anchorReason: anchor.reason }
+          : comment),
+      }
+    }),
     toggleLock: (paragraphId) => record((state) => ({
       paragraphs: state.paragraphs.map((paragraph) => paragraph.id === paragraphId ? {
         ...paragraph,
@@ -140,14 +219,16 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     addConflict: (conflict) => set((state) => ({ conflicts: [conflict, ...state.conflicts] })),
     resolveConflict: (conflictId, strategy) => record((state) => {
       const conflict = state.conflicts.find((item) => item.id === conflictId)
-      return {
-        paragraphs: conflict && strategy === 'remote'
-          ? state.paragraphs.map((paragraph) => paragraph.id === conflict.paragraphId ? { ...paragraph, text: conflict.remoteText, highlighted: true } : paragraph)
-          : state.paragraphs,
-        conflicts: state.conflicts.filter((item) => item.id !== conflictId),
+      let paragraphs = state.paragraphs
+      if (conflict && strategy === 'remote') {
+        paragraphs = state.paragraphs.map((paragraph) => paragraph.id === conflict.paragraphId ? { ...paragraph, text: conflict.remoteText, highlighted: true } : paragraph)
       }
+      const changed = paragraphs.find((paragraph) => paragraph.id === conflict?.paragraphId)
+      const comments = changed ? reanchorParagraph(state.comments, changed) : state.comments
+      return { paragraphs, comments, conflicts: state.conflicts.filter((item) => item.id !== conflictId) }
     }),
     dismissConflict: (conflictId) => set((state) => ({ conflicts: state.conflicts.filter((item) => item.id !== conflictId) })),
+    // 撤销上一次改写时，批注的落点随快照一起退回去
     undo: () => set((state) => {
       const previous = state.past.at(-1)
       if (!previous) return state
@@ -168,8 +249,8 @@ export const useReviewStore = create<ReviewState>((set, get) => {
     },
     resetDemo: () => {
       localStorage.removeItem(DRAFT_KEY)
-      set({ paragraphs: clone(baseParagraphs), comments: clone(baseComments), versions: clone(initialVersions), conflicts: [], past: [], future: [], dirty: false })
-      persistDraft(baseParagraphs, baseComments, initialVersions)
+      set({ paragraphs: clone(baseParagraphs), comments: clone(seededComments), versions: clone(seedVersions), conflicts: [], past: [], future: [], dirty: false })
+      persistDraft(baseParagraphs, seededComments, seedVersions)
     },
   }
 })

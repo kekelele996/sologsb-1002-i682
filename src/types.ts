@@ -2,6 +2,8 @@ export type Role = 'author' | 'reviewer' | 'editor'
 export type ParagraphStatus = 'open' | 'accepted' | 'locked'
 export type CommentStatus = 'open' | 'accepted' | 'rejected' | 'merged'
 export type CommentType = 'comment' | 'suggestion'
+/** anchored：引用原句在正文中有落点；pending：正文改动后落不回去，待处理 */
+export type AnchorStatus = 'anchored' | 'pending'
 
 export interface Reply {
   id: string
@@ -24,6 +26,12 @@ export interface Comment {
   replies: Reply[]
   createdAt: number
   mergedInto?: string
+  /** 引用原句的落点状态：随正文修订重新确认 */
+  anchorStatus: AnchorStatus
+  /** 引用原句在所属段落中的最近落点偏移，-1 表示当前无落点 */
+  anchorOffset: number
+  /** 落不回去时的原因说明 */
+  anchorReason?: string
 }
 
 export interface Paragraph {

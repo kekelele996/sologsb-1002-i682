@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowLeftOutlined, ArrowRightOutlined, BranchesOutlined, CheckOutlined, CloseOutlined,
-  CommentOutlined, DiffOutlined, DeleteOutlined, FileDoneOutlined, FileTextOutlined,
+  AimOutlined, ArrowLeftOutlined, ArrowRightOutlined, BranchesOutlined, CheckOutlined, CloseOutlined,
+  CommentOutlined, DiffOutlined, DeleteOutlined, ExclamationCircleOutlined, FileDoneOutlined, FileTextOutlined,
   HistoryOutlined, LockOutlined, MenuFoldOutlined, MessageOutlined, PlusOutlined,
   RedoOutlined, SaveOutlined, SendOutlined, SwapOutlined, UndoOutlined, UnlockOutlined, UserSwitchOutlined,
 } from '@ant-design/icons'
 import { Alert, Badge, Button, Card, Checkbox, Divider, Empty, Input, Modal, Radio, Segmented, Select, Space, Tag, Tooltip, message } from 'antd'
+import { buildSegments } from './services/anchors'
 import { submitRemotePatch } from './services/mockApi'
 import { useReviewStore } from './store/review'
 import type { Comment, CommentType, Paragraph, Role } from './types'
@@ -18,11 +19,38 @@ const roleMeta: Record<Role, { label: string; description: string; color: string
 const roleIcon = (role: Role) => role === 'author' ? <FileDoneOutlined /> : role === 'reviewer' ? <CommentOutlined /> : <BranchesOutlined />
 const formatDate = (value: number) => new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 
+/** 带原句落点高亮的正文：批注挂在引用的那句话上，点击落点跳到对应批注 */
+function AnnotatedText({ text, anchors, activeId, onLocate }: {
+  text: string
+  anchors: { id: string; offset: number; quote: string; type: CommentType; author: string }[]
+  activeId: string | null
+  onLocate: (commentId: string) => void
+}) {
+  const segments = useMemo(() => buildSegments(text, anchors.map(({ id, offset, quote }) => ({ id, offset, quote }))), [text, anchors])
+  const anchorMap = useMemo(() => new Map(anchors.map((anchor) => [anchor.id, anchor])), [anchors])
+  return (
+    <p className="paragraph-text annotated">
+      {segments.map((segment) => {
+        const anchor = segment.commentIds[0] ? anchorMap.get(segment.commentIds[0]) : undefined
+        if (!anchor) return <span key={segment.start}>{segment.text}</span>
+        return (
+          <mark
+            key={segment.start}
+            className={`anchor-mark ${anchor.type} ${anchor.id === activeId ? 'active' : ''}`}
+            title={`${anchor.author} · 点击查看批注`}
+            onClick={(event) => { event.stopPropagation(); onLocate(anchor.id) }}
+          >{segment.text}</mark>
+        )
+      })}
+    </p>
+  )
+}
+
 export default function App() {
   const {
     role, paragraphs, comments, versions, selectedParagraphId, commentFilter, revisionMode, dirty, conflicts,
     setRole, selectParagraph, setCommentFilter, setRevisionMode, updateParagraph, addComment, replyComment,
-    resolveSuggestion, mergeComment, toggleLock, createVersion, addConflict, resolveConflict, dismissConflict,
+    resolveSuggestion, mergeComment, requoteComment, toggleLock, createVersion, addConflict, resolveConflict, dismissConflict,
     undo, redo, save, resetDemo,
   } = useReviewStore()
   const [composerOpen, setComposerOpen] = useState(false)
@@ -31,6 +59,10 @@ export default function App() {
   const [suggestion, setSuggestion] = useState('')
   const [quote, setQuote] = useState('')
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({})
+  const [focusedCommentId, setFocusedCommentId] = useState<string | null>(null)
+  const [requoteId, setRequoteId] = useState<string | null>(null)
+  const [requoteDraft, setRequoteDraft] = useState('')
+  const focusTimer = useRef<number | undefined>(undefined)
   const [versionOpen, setVersionOpen] = useState(false)
   const [versionA, setVersionA] = useState(versions[1]?.id ?? versions[0]?.id)
   const [versionB, setVersionB] = useState(versions[0]?.id)
@@ -45,10 +77,36 @@ export default function App() {
   const duplicateParagraphIds = useMemo(() => new Set(Object.entries(paragraphCommentCounts).filter(([, count]) => count > 1).map(([id]) => id)), [paragraphCommentCounts])
   const visibleComments = useMemo(() => comments.filter((comment) => {
     if (commentFilter === 'open') return comment.status === 'open'
+    if (commentFilter === 'pending') return comment.status === 'open' && comment.anchorStatus === 'pending'
     if (commentFilter === 'suggestion') return comment.type === 'suggestion' && comment.status === 'open'
     if (commentFilter === 'duplicate') return duplicateParagraphIds.has(comment.paragraphId) && comment.status === 'open'
     return true
   }).sort((a, b) => b.createdAt - a.createdAt), [commentFilter, comments, duplicateParagraphIds])
+
+  const pendingCount = comments.filter((comment) => comment.status === 'open' && comment.anchorStatus === 'pending').length
+
+  /** 每段正文中已确认落点的批注（被合并的保留记录，不再参与高亮） */
+  const anchorsByParagraph = useMemo(() => {
+    const map = new Map<string, { id: string; offset: number; quote: string; type: CommentType; author: string }[]>()
+    for (const comment of comments) {
+      if (comment.status === 'merged' || comment.anchorStatus !== 'anchored') continue
+      const list = map.get(comment.paragraphId) ?? []
+      list.push({ id: comment.id, offset: comment.anchorOffset, quote: comment.quote, type: comment.type, author: comment.author })
+      map.set(comment.paragraphId, list)
+    }
+    return map
+  }, [comments])
+  /** 每段落不回去的批注及其原因 */
+  const pendingByParagraph = useMemo(() => {
+    const map = new Map<string, Comment[]>()
+    for (const comment of comments) {
+      if (comment.status !== 'open' || comment.anchorStatus !== 'pending') continue
+      const list = map.get(comment.paragraphId) ?? []
+      list.push(comment)
+      map.set(comment.paragraphId, list)
+    }
+    return map
+  }, [comments])
 
   useEffect(() => {
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
@@ -88,6 +146,32 @@ export default function App() {
   const scrollToParagraph = (id: string) => {
     selectParagraph(id)
     document.getElementById(`paragraph-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }
+  /** 点击正文落点：滚到对应批注并短暂高亮；该批注被当前筛选藏掉时先切回“全部” */
+  const locateComment = (commentId: string) => {
+    const target = comments.find((item) => item.id === commentId)
+    if (!target) return
+    selectParagraph(target.paragraphId)
+    if (!visibleComments.some((item) => item.id === commentId)) setCommentFilter('all')
+    window.setTimeout(() => {
+      document.getElementById(`comment-${commentId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      setFocusedCommentId(commentId)
+      window.clearTimeout(focusTimer.current)
+      focusTimer.current = window.setTimeout(() => setFocusedCommentId(null), 2200)
+    }, 60)
+  }
+  const jumpToComment = locateComment
+  const openRequote = (commentId: string) => {
+    const target = comments.find((item) => item.id === commentId)
+    setRequoteId(commentId)
+    setRequoteDraft(target?.quote ?? '')
+  }
+  const submitRequote = () => {
+    if (!requoteId) return
+    if (!requoteDraft.trim()) { message.warning('请先选中或填写引用原句'); return }
+    requoteComment(requoteId, requoteDraft.trim())
+    setRequoteId(null)
+    message.success('已按新原句重新确认落点')
   }
   const openComposer = (type: CommentType) => {
     const selectedText = window.getSelection()?.toString().trim()
@@ -215,15 +299,30 @@ export default function App() {
                       {paragraph.status === 'accepted' && <Tag icon={<CheckOutlined />} color="green">已确认</Tag>}
                       {!!paragraphCommentCounts[paragraph.id] && <Tag icon={<MessageOutlined />}>{paragraphCommentCounts[paragraph.id]} 条意见</Tag>}
                     </div>
+                    {!!pendingByParagraph.get(paragraph.id)?.length && (
+                      <div className="pending-strip">
+                        {pendingByParagraph.get(paragraph.id)!.map((comment) => (
+                          <button key={comment.id} onClick={(event) => { event.stopPropagation(); locateComment(comment.id) }}>
+                            <ExclamationCircleOutlined /> 落点待确认 · {comment.author}：{comment.anchorReason}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                     {revisionMode ? (
                       <div className="revision-grid">
-                        <div><small>原稿</small><p>{paragraph.original}</p></div>
-                        <div><small>当前修订</small><p>{paragraph.text}</p></div>
+                        <div>
+                          <small>原稿</small>
+                          <AnnotatedText text={paragraph.original} anchors={[]} activeId={focusedCommentId} onLocate={locateComment} />
+                        </div>
+                        <div>
+                          <small>当前修订 · 批注按原句确认落点</small>
+                          <AnnotatedText text={paragraph.text} anchors={anchorsByParagraph.get(paragraph.id) ?? []} activeId={focusedCommentId} onLocate={locateComment} />
+                        </div>
                       </div>
                     ) : role === 'author' ? (
                       <Input.TextArea autoSize={{ minRows: 2, maxRows: 8 }} value={paragraph.text} readOnly={paragraph.status === 'locked'} onChange={(event) => updateParagraph(paragraph.id, event.target.value)} />
                     ) : (
-                      <p className="paragraph-text">{paragraph.text}</p>
+                      <AnnotatedText text={paragraph.text} anchors={anchorsByParagraph.get(paragraph.id) ?? []} activeId={focusedCommentId} onLocate={locateComment} />
                     )}
                     <div className="paragraph-actions">
                       {role === 'reviewer' && <><Button size="small" icon={<CommentOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('comment') }}>添加批注</Button><Button size="small" icon={<FileDoneOutlined />} onClick={(event) => { event.stopPropagation(); selectParagraph(paragraph.id); openComposer('suggestion') }}>提出建议</Button></>}
@@ -243,30 +342,52 @@ export default function App() {
           </div>
           <div className="comment-filters">
             <Radio.Group value={commentFilter} onChange={(event) => setCommentFilter(event.target.value)} buttonStyle="solid" size="small">
-              <Radio.Button value="all">全部</Radio.Button><Radio.Button value="open">待处理</Radio.Button><Radio.Button value="suggestion">建议</Radio.Button><Radio.Button value="duplicate">重复</Radio.Button>
+              <Radio.Button value="all">全部</Radio.Button><Radio.Button value="open">待处理</Radio.Button><Radio.Button value="pending">落点待确认{pendingCount ? ` (${pendingCount})` : ''}</Radio.Button><Radio.Button value="suggestion">建议</Radio.Button><Radio.Button value="duplicate">重复</Radio.Button>
             </Radio.Group>
           </div>
           <div className="comment-list">
             {visibleComments.map((comment) => {
               const paragraph = paragraphs.find((item) => item.id === comment.paragraphId)
+              const mergedTarget = comment.status === 'merged'
+                ? comments.find((item) => item.id === comment.mergedInto)
+                : undefined
               return (
-                <Card key={comment.id} size="small" className={`comment-card ${comment.status}`} title={<span>{comment.author} <Tag>{comment.type === 'suggestion' ? '修改建议' : '段落批注'}</Tag></span>} extra={<small>{formatDate(comment.createdAt)}</small>}>
-                  <button className="quote-line" onClick={() => paragraph && scrollToParagraph(paragraph.id)}>“{comment.quote}” · 段落 {paragraph?.number}</button>
-                  <p className="comment-body">{comment.body}</p>
-                  {comment.suggestion && <div className="suggestion-box"><small>建议改为</small><p>{comment.suggestion}</p></div>}
-                  {comment.status !== 'open' && <Tag color={comment.status === 'accepted' ? 'green' : comment.status === 'rejected' ? 'red' : 'blue'}>{comment.status === 'accepted' ? '已接受' : comment.status === 'rejected' ? '已拒绝' : '已合并'}</Tag>}
-                  <div className="replies">
-                    {comment.replies.map((reply) => <div key={reply.id} className="reply"><b>{reply.author}</b><span>{reply.body}</span></div>)}
-                  </div>
-                  <div className="reply-box">
-                    <Input size="small" value={replyDrafts[comment.id] ?? ''} onChange={(event) => setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: event.target.value }))} placeholder="回复讨论…" onPressEnter={() => { const body = replyDrafts[comment.id]?.trim(); if (body) { replyComment(comment.id, body); setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: '' })) } }} />
-                    <Button size="small" type="text" icon={<SendOutlined />} onClick={() => { const body = replyDrafts[comment.id]?.trim(); if (body) { replyComment(comment.id, body); setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: '' })) } }} />
-                  </div>
-                  {comment.status === 'open' && role === 'author' && comment.type === 'suggestion' && <div className="decision-row"><Button type="primary" size="small" icon={<CheckOutlined />} onClick={() => resolveSuggestion(comment.id, true)}>接受修改</Button><Button danger size="small" icon={<CloseOutlined />} onClick={() => resolveSuggestion(comment.id, false)}>拒绝</Button></div>}
-                  {comment.status === 'open' && role === 'editor' && duplicateParagraphIds.has(comment.paragraphId) && (() => {
-                    const sibling = comments.find((item) => item.id !== comment.id && item.paragraphId === comment.paragraphId && item.status === 'open')
-                    return sibling ? <Button size="small" type="dashed" icon={<BranchesOutlined />} onClick={() => mergeComment(comment.id, sibling.id)}>合并到“{sibling.author}”意见</Button> : null
-                  })()}
+                <Card key={comment.id} size="small" id={`comment-${comment.id}`}
+                  className={`comment-card ${comment.status} ${focusedCommentId === comment.id ? 'focused' : ''}`}
+                  title={<span>{comment.author} <Tag>{comment.type === 'suggestion' ? '修改建议' : '段落批注'}</Tag></span>} extra={<small>{formatDate(comment.createdAt)}</small>}>
+                  <button className="quote-line" onClick={() => paragraph && scrollToParagraph(paragraph.id)}>“{comment.quote || '（未记录引用原句）'}” · 段落 {paragraph?.number}</button>
+                  {comment.status === 'open' && comment.anchorStatus === 'pending' && (
+                    <Alert className="anchor-alert" type="warning" showIcon icon={<ExclamationCircleOutlined />}
+                      message="落点待确认" description={comment.anchorReason} />
+                  )}
+                  {comment.status === 'merged' && mergedTarget ? (
+                    <div className="merged-note">
+                      <Tag color="blue">已合并</Tag>
+                      <span>本条重复意见已并入 {mergedTarget.author} 的意见，讨论已转移到该条。</span>
+                      <Button size="small" type="link" onClick={() => jumpToComment(mergedTarget.id)}>查看保留的意见 →</Button>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="comment-body">{comment.body}</p>
+                      {comment.suggestion && <div className="suggestion-box"><small>建议改为</small><p>{comment.suggestion}</p></div>}
+                      {comment.status !== 'open' && <Tag color={comment.status === 'accepted' ? 'green' : comment.status === 'rejected' ? 'red' : 'blue'}>{comment.status === 'accepted' ? '已接受' : comment.status === 'rejected' ? '已拒绝' : '已合并'}</Tag>}
+                      <div className="replies">
+                        {comment.replies.map((reply) => <div key={reply.id} className="reply"><b>{reply.author}</b><span>{reply.body}</span></div>)}
+                      </div>
+                      <div className="reply-box">
+                        <Input size="small" value={replyDrafts[comment.id] ?? ''} onChange={(event) => setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: event.target.value }))} placeholder="回复讨论…" onPressEnter={() => { const body = replyDrafts[comment.id]?.trim(); if (body) { replyComment(comment.id, body); setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: '' })) } }} />
+                        <Button size="small" type="text" icon={<SendOutlined />} onClick={() => { const body = replyDrafts[comment.id]?.trim(); if (body) { replyComment(comment.id, body); setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: '' })) } }} />
+                      </div>
+                      {comment.status === 'open' && comment.anchorStatus === 'pending' && role === 'reviewer' && (
+                        <Button size="small" type="dashed" icon={<AimOutlined />} onClick={() => openRequote(comment.id)}>重新指定引用原句</Button>
+                      )}
+                      {comment.status === 'open' && role === 'author' && comment.type === 'suggestion' && <div className="decision-row"><Button type="primary" size="small" icon={<CheckOutlined />} onClick={() => resolveSuggestion(comment.id, true)}>接受修改</Button><Button danger size="small" icon={<CloseOutlined />} onClick={() => resolveSuggestion(comment.id, false)}>拒绝</Button></div>}
+                      {comment.status === 'open' && role === 'editor' && duplicateParagraphIds.has(comment.paragraphId) && (() => {
+                        const sibling = comments.find((item) => item.id !== comment.id && item.paragraphId === comment.paragraphId && item.status === 'open')
+                        return sibling ? <Button size="small" type="dashed" icon={<BranchesOutlined />} onClick={() => { mergeComment(comment.id, sibling.id); message.success(`讨论已转移到 ${sibling.author} 的意见`) }}>合并到“{sibling.author}”意见</Button> : null
+                      })()}
+                    </>
+                  )}
                 </Card>
               )
             })}
@@ -284,6 +405,13 @@ export default function App() {
           {commentType === 'suggestion' && <Input.TextArea value={suggestion} onChange={(event) => setSuggestion(event.target.value)} autoSize={{ minRows: 3, maxRows: 7 }} />}
           <label>说明</label>
           <Input.TextArea value={commentBody} onChange={(event) => setCommentBody(event.target.value)} placeholder="说明修改理由或希望作者关注的问题" autoSize={{ minRows: 2, maxRows: 5 }} />
+        </div>
+      </Modal>
+
+      <Modal title="重新指定引用原句" open={requoteId !== null} onCancel={() => setRequoteId(null)} onOk={submitRequote} okText="重新确认落点" cancelText="取消" width={620}>
+        <div className="composer">
+          <label>新的引用原句（需能在当前正文中找到，落不回去会继续留在待处理）</label>
+          <Input.TextArea value={requoteDraft} onChange={(event) => setRequoteDraft(event.target.value)} autoSize={{ minRows: 2, maxRows: 4 }} />
         </div>
       </Modal>
 
